@@ -140,7 +140,7 @@ def reconcile(
     resumen  = _build_resumen(bank_final, book)
     detalles = _build_detalles(bank_final, book)
 
-    return {'resumen': resumen, 'detalles': detalles}
+    return {'resumen': resumen, 'detalles': detalles, 'df_banco': bank_final, 'df_libro': book}
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +539,7 @@ def generate_report(
             'Estado'    : row.get('estado', ''),
         })
 
-    # Colores por estado para que sea mas amigable a la vista.
+    # Colores por estado
     COLORES = {
         'Conciliado'          : 'C6EFCE',  # verde suave
         'Posible Conciliacion': 'FFEB9C',  # amarillo suave
