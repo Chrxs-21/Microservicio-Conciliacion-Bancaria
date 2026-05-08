@@ -423,25 +423,57 @@ def _fecha_dentro_ventana(
     return abs((fecha_banco - fecha_libro).days) <= dias_ventana
 
 
-def _build_resumen(bank: pd.DataFrame, book: pd.DataFrame) -> dict:
+def _build_resumen(
+    bank: pd.DataFrame,
+    book: pd.DataFrame,
+    total_banco_crudo: int = 0,
+    total_libro_crudo: int = 0,
+) -> dict:
     """
     Construye el dict 'resumen' con todos los conteos requeridos por la API.
+
+    Sigue la estructura del enunciado como base y agrega campos adicionales
+    que aportan mayor visibilidad sobre el resultado de la conciliacion.
+
+    Campos del enunciado:
+      total_banco              : total de registros en el archivo del banco
+      total_libro              : total de registros en el archivo del libro
+      registros_filtrados_banco: registros descartados del banco por filtro
+      registros_filtrados_libro: registros descartados del libro por filtro
+      conciliados              : total de pares conciliados (banco + libro)
+      posibles_conciliados     : total en estado Posible Conciliacion
+      no_conciliados           : total en estado No Conciliado (banco + libro)
+
+    Campos adicionales (mayor visibilidad):
+      sin_prefijo_banco        : registros sin prefijo para revision de Finanzas
+      conciliados_banco        : conciliados solo del banco
+      conciliados_libro        : conciliados solo del libro
     """
-    conciliados_banco   = (bank['estado'] == 'Conciliado').sum()
-    conciliados_libro   = (book['estado'] == 'Conciliado').sum()
-    posibles_banco      = (bank['estado'] == 'Posible Conciliacion').sum()
-    posibles_libro      = (book['estado'] == 'Posible Conciliacion').sum()
+    conciliados_banco = int((bank['estado'] == 'Conciliado').sum())
+    conciliados_libro = int((book['estado'] == 'Conciliado').sum())
+    posibles_banco    = int((bank['estado'] == 'Posible Conciliacion').sum())
+    posibles_libro    = int((book['estado'] == 'Posible Conciliacion').sum())
+    no_conc_banco     = int((bank['estado'] == 'No Conciliado').sum())
+    no_conc_libro     = int((book['estado'] == 'No Conciliado').sum())
+    sin_prefijo       = int(bank.get('sin_prefijo', pd.Series(dtype=bool)).sum())
 
     return {
-        'total_banco'              : len(bank),
-        'total_libro'              : len(book),
-        'sin_prefijo_banco'        : int(bank.get('sin_prefijo', pd.Series(dtype=bool)).sum()),
-        'conciliados_banco'        : int(conciliados_banco),
-        'conciliados_libro'        : int(conciliados_libro),
-        'posibles_banco'           : int(posibles_banco),
-        'posibles_libro'           : int(posibles_libro),
-        'no_conciliados_banco'     : int((bank['estado'] == 'No Conciliado').sum()),
-        'no_conciliados_libro'     : int((book['estado'] == 'No Conciliado').sum()),
+        # -- Estructura exacta del enunciado --
+        'total_banco'               : total_banco_crudo or len(bank),
+        'total_libro'               : total_libro_crudo or len(book),
+        'registros_filtrados_banco' : max(0, (total_banco_crudo or len(bank)) - len(bank)),
+        'registros_filtrados_libro' : max(0, (total_libro_crudo or len(book)) - len(book)),
+        'conciliados'               : conciliados_banco + conciliados_libro,
+        'posibles_conciliados'      : posibles_banco + posibles_libro,
+        'no_conciliados'            : no_conc_banco + no_conc_libro,
+        # -- Campos adicionales para mayor visibilidad --
+        'sin_prefijo_banco'         : sin_prefijo,
+        'conciliados_banco'         : conciliados_banco,
+        'conciliados_libro'         : conciliados_libro,
+        'posibles_banco'            : posibles_banco,
+        'posibles_libro'            : posibles_libro,
+        'no_conciliados_banco'      : no_conc_banco,
+        'no_conciliados_libro'      : no_conc_libro,
     }
 
 
@@ -473,10 +505,26 @@ def _build_detalles(bank: pd.DataFrame, book: pd.DataFrame) -> list:
             combined[col].notna(), other=None
         )
 
-    # Reemplazar NaN por None para JSON limpio
-    combined = combined.where(combined.notna(), other=None)
+    # Reemplazar NaN por None para JSON limpio.
+    # fillna(value) no funciona para todos los tipos, por lo que usamos
+    # applymap para convertir cada celda individualmente.
+    import math
 
-    return combined.to_dict(orient='records')
+    def nan_to_none(val):
+        if val is None:
+            return None
+        try:
+            if math.isnan(float(val)) if not isinstance(val, str) else False:
+                return None
+        except (TypeError, ValueError):
+            pass
+        return val
+
+    records = combined.to_dict(orient='records')
+    return [
+        {k: nan_to_none(v) for k, v in row.items()}
+        for row in records
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +556,9 @@ def generate_report(
     from openpyxl.utils import get_column_letter
 
     if output_path is None:
-        output_path = os.path.join(OUTPUT_DIR, 'reporte_conciliacion.xlsx')
+        from datetime import datetime
+        timestamp   = datetime.now().strftime('%Y-%m-%d_%Hh%Mm%Ss')
+        output_path = os.path.join(OUTPUT_DIR, f'reporte_conciliacion_{timestamp}.xlsx')
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -550,15 +600,70 @@ def generate_report(
     ws = wb.active
     ws.title = 'Conciliacion'
 
-    # Encabezados
-    encabezados = ['Origen', 'Referencia', 'Tienda', 'Lote', 'Monto', 'Fecha', 'Estado']
-    for col_idx, titulo in enumerate(encabezados, start=1):
-        celda = ws.cell(row=1, column=col_idx, value=titulo)
-        celda.font      = Font(bold=True)
+    # -- Tabla de resumen --
+    total        = len(filas)
+    conciliados  = sum(1 for f in filas if f['Estado'] == 'Conciliado')
+    posibles     = sum(1 for f in filas if f['Estado'] == 'Posible Conciliacion')
+    no_conc      = sum(1 for f in filas if f['Estado'] == 'No Conciliado')
+    pct_conc     = round(conciliados / total * 100, 1) if total else 0
+
+    FILL_RESUMEN = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+    FILL_TITULO  = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
+    FONT_BLANCO  = Font(bold=True, color='FFFFFF')
+    FONT_BOLD    = Font(bold=True)
+
+    # Titulo del resumen
+    titulo_celda = ws.cell(row=1, column=1, value='RESUMEN DE CONCILIACION')
+    titulo_celda.font      = FONT_BLANCO
+    titulo_celda.fill      = FILL_TITULO
+    titulo_celda.alignment = Alignment(horizontal='center')
+    ws.merge_cells('A1:G1')
+
+    # Encabezados del resumen
+    headers_resumen = ['Total Registros', 'Conciliados', '% Conciliado',
+                       'Posible Conciliacion', 'No Conciliados',
+                       'Banco', 'Libro']
+    for col_idx, h in enumerate(headers_resumen, start=1):
+        celda       = ws.cell(row=2, column=col_idx, value=h)
+        celda.font  = FONT_BOLD
+        celda.fill  = FILL_RESUMEN
         celda.alignment = Alignment(horizontal='center')
 
-    # Datos con color por estado
-    for row_idx, fila in enumerate(filas, start=2):
+    # Valores del resumen
+    total_banco = sum(1 for f in filas if f['Origen'] == 'Banco')
+    total_libro = sum(1 for f in filas if f['Origen'] == 'Libro')
+    valores_resumen = [total, conciliados, f'{pct_conc}%',
+                       posibles, no_conc, total_banco, total_libro]
+    for col_idx, val in enumerate(valores_resumen, start=1):
+        celda           = ws.cell(row=3, column=col_idx, value=val)
+        celda.alignment = Alignment(horizontal='center')
+        celda.fill      = FILL_RESUMEN
+
+    # Fila de leyenda de colores
+    ws.cell(row=5, column=1, value='Leyenda:').font = FONT_BOLD
+    leyenda = [
+        ('Conciliado',           'C6EFCE'),
+        ('Posible Conciliacion', 'FFEB9C'),
+        ('No Conciliado',        'FFC7CE'),
+    ]
+    for col_idx, (label, color) in enumerate(leyenda, start=2):
+        celda      = ws.cell(row=5, column=col_idx, value=label)
+        celda.fill = PatternFill(start_color=color, end_color=color, fill_type='solid')
+        celda.alignment = Alignment(horizontal='center')
+
+    # Fila en blanco separadora
+    fila_inicio_detalle = 7
+
+    # -- Encabezados de la tabla de detalle --
+    encabezados = ['Origen', 'Referencia', 'Tienda', 'Lote', 'Monto', 'Fecha', 'Estado']
+    for col_idx, titulo in enumerate(encabezados, start=1):
+        celda           = ws.cell(row=fila_inicio_detalle, column=col_idx, value=titulo)
+        celda.font      = FONT_BLANCO
+        celda.fill      = FILL_TITULO
+        celda.alignment = Alignment(horizontal='center')
+
+    # -- Datos con color por estado --
+    for row_idx, fila in enumerate(filas, start=fila_inicio_detalle + 1):
         estado = fila.get('Estado', '')
         fill   = PatternFill(
             start_color=COLORES.get(estado, 'FFFFFF'),
@@ -572,7 +677,7 @@ def generate_report(
 
     # Ajustar ancho de columnas
     for col_idx in range(1, len(encabezados) + 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 20
+        ws.column_dimensions[get_column_letter(col_idx)].width = 22
 
     wb.save(output_path)
     return output_path
